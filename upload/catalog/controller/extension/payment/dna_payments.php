@@ -1,5 +1,9 @@
 <?php
 class ControllerExtensionPaymentDNAPayments extends Controller {
+  const PLUGIN_VERSION = '1.0.2';
+  const TELEMETRY_API_URL_PROD = 'https://telemetry-api.dnapayments.com/v1/cms-plugins-versions';
+  const TELEMETRY_API_URL_TEST = 'https://test-telemetry-api.dnapayments.com/v1/cms-plugins-versions';
+  const ANALYTICS_HASH_FILE = 'dna_payments_analytics_hash.txt';
 
   public function index() {
     $this->load->language('extension/payment/dna_payments');
@@ -138,6 +142,8 @@ class ControllerExtensionPaymentDNAPayments extends Controller {
       return $this->log('error', 'not valid signature');
     }
 
+    $this->sendAnalytics();
+
     $order_id = (int)$response['invoiceId'];
     $this->load->model('checkout/order');
     $order_info = $this->model_checkout_order->getOrder($order_id);
@@ -200,6 +206,109 @@ class ControllerExtensionPaymentDNAPayments extends Controller {
 
     curl_close($ch);
     return $result;
+  }
+
+  /**
+   * Sends plugin and platform versions to the DNA telemetry API, the same way the
+   * WooCommerce, Magento 2, PrestaShop and OpenCart 3 plugins do. Data is sent only when
+   * it changed since the last successful send; errors are logged and never break the callback.
+   */
+  private function sendAnalytics()
+  {
+    try {
+      $is_test_mode = $this->config->get('dna_payments_test_mode') == '1';
+      $client_id = $this->config->get($is_test_mode ? 'dna_payments_test_client_id' : 'dna_payments_client_id');
+      if (empty($client_id) || !$this->getClientSecret()) {
+        return;
+      }
+
+      $data = $this->getAnalyticsData($is_test_mode);
+      $hash = hash('sha256', json_encode($data));
+      $hash_file = $this->getAnalyticsHashFile();
+
+      if (is_file($hash_file) && file_get_contents($hash_file) === $hash) {
+        return;
+      }
+
+      $token = $this->getApiToken();
+      if ($token === null) {
+        throw new \Exception('Could not get DNA access token');
+      }
+
+      $this->sendTelemetry($token, $data, $is_test_mode);
+
+      file_put_contents($hash_file, $hash);
+    } catch (\Exception $e) {
+      $this->log('analytics error', $e->getMessage());
+    } catch (\Throwable $e) {
+      $this->log('analytics error', $e->getMessage());
+    }
+  }
+
+  private function getAnalyticsData($is_test_mode)
+  {
+    $host = !empty($this->request->server['HTTP_HOST'])
+      ? $this->request->server['HTTP_HOST']
+      : parse_url(HTTPS_SERVER, PHP_URL_HOST);
+
+    return array(
+      'integrationType' => $this->config->get('dna_payments_type') == '1' ? 'hosted' : 'embedded',
+      'terminalId' => $this->config->get($is_test_mode ? 'dna_payments_test_terminal' : 'dna_payments_terminal'),
+      'phpVersion' => phpversion(),
+      'domainName' => $host,
+      'pluginVersion' => self::PLUGIN_VERSION,
+      'cmsPlatformName' => 'OpenCart',
+      'cmsPlatformVersion' => VERSION
+    );
+  }
+
+  private function getAnalyticsHashFile()
+  {
+    return (defined('DIR_STORAGE') ? DIR_STORAGE : DIR_CACHE) . self::ANALYTICS_HASH_FILE;
+  }
+
+  // Access token for the DNA web API.
+  private function getApiToken()
+  {
+    $is_test_mode = $this->config->get('dna_payments_test_mode') == '1';
+    $auth = $this->sendPost($this->getAuthUrl(), array(
+      'grant_type' => 'client_credentials',
+      'scope' => 'webapi',
+      'client_id' => $this->config->get($is_test_mode ? 'dna_payments_test_client_id' : 'dna_payments_client_id'),
+      'client_secret' => $this->getClientSecret()
+    ));
+    if (!$auth || $auth['status'] < 200 || $auth['status'] >= 300
+      || empty($auth['response']['access_token']) || !is_string($auth['response']['access_token'])) {
+      return null;
+    }
+    return $auth['response']['access_token'];
+  }
+
+  private function sendTelemetry($token, array $data, $is_test_mode)
+  {
+    $ch = curl_init($is_test_mode ? self::TELEMETRY_API_URL_TEST : self::TELEMETRY_API_URL_PROD);
+    curl_setopt_array($ch, array(
+      CURLOPT_POST => TRUE,
+      CURLOPT_RETURNTRANSFER => TRUE,
+      CURLOPT_CONNECTTIMEOUT => 10,
+      CURLOPT_TIMEOUT => 10,
+      CURLOPT_HTTPHEADER => array(
+        'Content-Type: application/json',
+        'Authorization: Bearer ' . $token
+      ),
+      CURLOPT_POSTFIELDS => json_encode($data)
+    ));
+    $body = curl_exec($ch);
+    $error = curl_errno($ch) ? curl_error($ch) : null;
+    $status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    if ($error !== null) {
+      throw new \Exception('Telemetry request failed: ' . $error);
+    }
+    if ($status !== 200) {
+      throw new \Exception('Telemetry API Error [' . $status . ']: ' . $body);
+    }
   }
 
   private function log($method, $message) {
